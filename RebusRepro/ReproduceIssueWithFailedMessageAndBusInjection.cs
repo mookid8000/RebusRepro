@@ -3,6 +3,7 @@ using NUnit.Framework;
 using Rebus.Bus;
 using Rebus.Config;
 using Rebus.Handlers;
+using Rebus.Persistence.InMem;
 using Rebus.Retry.Simple;
 using Rebus.Transport.InMem;
 using Testy;
@@ -20,11 +21,11 @@ public class ReproduceIssueWithFailedMessageAndBusInjection : FixtureBase
         var services = new ServiceCollection();
 
         services.AddSingleton(flags);
-
         services.AddRebus(
             configure => configure
-                .Logging(l => l.Console())
+                .Logging(l => l.None())
                 .Transport(t => t.UseInMemoryTransport(new(), "whateer"))
+                .Timeouts(t => t.StoreInMemory())
                 .Options(o => o.SimpleRetryStrategy(secondLevelRetriesEnabled: true, maxDeliveryAttempts: 2))
         );
 
@@ -38,18 +39,32 @@ public class ReproduceIssueWithFailedMessageAndBusInjection : FixtureBase
 
         await bus.SendLocal(new MyMessage());
 
-        Assert.IsTrue(flags.MyMessageFlags.GotTheMessage.WaitOne(TimeSpan.FromSeconds(3)));
-        Assert.IsTrue(flags.FailedMyMessageFlags.GotTheMessage.WaitOne(TimeSpan.FromSeconds(3)));
+        var timeout = TimeSpan.FromSeconds(23);
 
-        Assert.That(flags.MyMessageFlags.BusProperlyInjected, Is.True);
-        Assert.That(flags.FailedMyMessageFlags.BusProperlyInjected, Is.True);
+        Assert.IsTrue(flags.MyMessageFlags.GotTheMessage.WaitOne(timeout));
+        Assert.IsTrue(flags.MyMessageFlags.GotTheMessage.WaitOne(timeout));
+        Assert.IsTrue(flags.FailedMyMessageFlags.GotTheMessage.WaitOne(timeout));
+
+        Assert.That(flags.MyMessageFlags.BusProperlyInjectedCount, Is.EqualTo(2));
+        Assert.That(flags.MyMessageFlags.FailedRuns, Is.EqualTo(2));
+        Assert.That(flags.FailedMyMessageFlags.BusProperlyInjectedCount, Is.EqualTo(1));
+        Assert.That(flags.FailedMyMessageFlags.FailedRuns == 1, Is.True);
+
+        Assert.IsTrue(flags.MyMessageFlags.GotTheMessage.WaitOne(timeout));
+        Assert.IsTrue(flags.MyMessageFlags.GotTheMessage.WaitOne(timeout));
+        Assert.IsTrue(flags.FailedMyMessageFlags.GotTheMessage.WaitOne(timeout));
+
+        Assert.That(flags.MyMessageFlags.BusProperlyInjectedCount, Is.EqualTo(4));
+        Assert.That(flags.MyMessageFlags.FailedRuns, Is.EqualTo(4));
+        Assert.That(flags.FailedMyMessageFlags.BusProperlyInjectedCount, Is.EqualTo(2));
+        Assert.That(flags.FailedMyMessageFlags.FailedRuns == 2, Is.True);
     }
 
     class FlagsAndResetEvents
     {
-        public readonly ManualResetEvent GotTheMessage = new(initialState: false);
-
-        public bool BusProperlyInjected { get; set; }
+        public readonly AutoResetEvent GotTheMessage = new(initialState: false);
+        public int BusProperlyInjectedCount { get; set; }
+        public int FailedRuns { get; set; }
     }
 
     class AllTheFlags
@@ -58,7 +73,7 @@ public class ReproduceIssueWithFailedMessageAndBusInjection : FixtureBase
         public readonly FlagsAndResetEvents FailedMyMessageFlags = new();
     }
 
-    record MyMessage();
+    record MyMessage;
 
     class MyMessageHandler : IHandleMessages<MyMessage>, IHandleMessages<IFailed<MyMessage>>
     {
@@ -67,15 +82,20 @@ public class ReproduceIssueWithFailedMessageAndBusInjection : FixtureBase
 
         public MyMessageHandler(IBus bus, AllTheFlags flags)
         {
-            _flags = flags ?? throw new ArgumentNullException(nameof(flags));
+            Console.WriteLine($"MyMessageHandler created with {bus}, {flags}");
+            _flags = flags;
             _bus = bus;
         }
 
         public async Task Handle(MyMessage message)
         {
             var flags = _flags.MyMessageFlags;
-            flags.BusProperlyInjected = _bus != null;
+
+            flags.BusProperlyInjectedCount += _bus != null ? 1 : 0;
+            flags.FailedRuns++;
             flags.GotTheMessage.Set();
+
+            Console.WriteLine($"MyMessage handled - flags: {new { flags.BusProperlyInjectedCount, flags.FailedRuns }}");
 
             throw new ApplicationException("Trigger 2nd level delivery");
         }
@@ -83,8 +103,17 @@ public class ReproduceIssueWithFailedMessageAndBusInjection : FixtureBase
         public async Task Handle(IFailed<MyMessage> message)
         {
             var flags = _flags.FailedMyMessageFlags;
-            flags.BusProperlyInjected = _bus != null;
+
+            flags.BusProperlyInjectedCount += _bus != null ? 1 : 0;
+            flags.FailedRuns++;
             flags.GotTheMessage.Set();
+
+            if (flags.FailedRuns == 1)
+            {
+                await _bus.DeferLocal(TimeSpan.FromSeconds(1), message.Message);
+            }
+
+            Console.WriteLine($"IFailed<MyMessage> handled - flags: {new { flags.BusProperlyInjectedCount, flags.FailedRuns }}");
         }
     }
 }
